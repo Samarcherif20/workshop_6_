@@ -1,0 +1,15 @@
+// test/queue_provider_test.dart
+import 'package:flutter_test/flutter_test.dart';
+import 'package:mockito/mockito.dart';
+import 'package:waiting_room_app___4/queue_provider.dart';
+class MockSupabaseClient extends Mock implements SupabaseClient {}
+void main() {
+ test('addClient calls insert', () {
+ final mockClient = MockSupabaseClient();
+ final provider = QueueProvider._forTesting(mockClient); // Add constructor
+ when(mockClient.from('clients').insert(any)).thenAnswer((_) async =>
+Response(data: [], error: null));
+ provider.addClient("Alice");
+ verify(mockClient.from('clients').insert({'name': 'Alice'})).called(1);
+ });
+}

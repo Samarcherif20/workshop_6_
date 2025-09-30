@@ -11,9 +11,10 @@ class QueueProvider extends ChangeNotifier {
   late RealtimeChannel _subscription;
 
   QueueProvider() {
-    _fetchInitialClients();
-    _setupRealtimeSubscription();
+    _fetchInitialClients();  // Charge les données initiales
+    _setupRealtimeSubscription(); // S'abonne aux mises à jour
   }
+  
 
   /// Fetch all clients that already exist in the DB
   Future<void> _fetchInitialClients() async {
@@ -32,6 +33,7 @@ class QueueProvider extends ChangeNotifier {
     } catch (e) {
       print('Error fetching clients: $e');
     }
+    notifyListeners();
   }
 
   /// Realtime subscription (INSERT + DELETE)
@@ -68,7 +70,9 @@ class QueueProvider extends ChangeNotifier {
           }
         },
       )
-      .subscribe();
+      .subscribe();// DÉMARE l'écoute - CRITIQUE!
+    // Sans subscribe(), aucun événement n'est reçu
+    // Retourne un StreamSubscription qu'on stocke dans _subscription
   }
 
   /// Add a new client
