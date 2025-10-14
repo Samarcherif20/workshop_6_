@@ -1,14 +1,15 @@
-// This is a basic Flutter widget test.
-//
-// To perform an interaction with a widget in your test, use the WidgetTester
-// utility in the flutter_test package. For example, you can send tap and scroll
-// gestures. You can also use WidgetTester to find child widgets in the widget
-// tree, read text, and verify that the values of widget properties are correct.
-
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:mockito/annotations.dart';
+import 'package:mockito/mockito.dart';
+import 'package:provider/provider.dart';
 
-import 'package:waiting_room_app___4/main.dart';
+import 'package:waiting_room_app_5/main.dart';
+import 'package:waiting_room_app_5/queue_provider.dart';
+import 'package:waiting_room_app_5/models/client.dart';
+
+@GenerateMocks([QueueProvider])
+import 'widget_test.mocks.dart';
 
 void main() {
   testWidgets('Counter increments smoke test', (WidgetTester tester) async {
@@ -26,5 +27,28 @@ void main() {
     // Verify that our counter has incremented.
     expect(find.text('0'), findsNothing);
     expect(find.text('1'), findsOneWidget);
+  });
+
+  testWidgets('Displays location when available', (WidgetTester tester) async {
+    final provider = MockQueueProvider();
+    when(provider.clients).thenReturn([
+      Client(
+        id: '1',
+        name: 'Sam',
+        lat: 51.5074,
+        lng: -0.1278,
+        createdAt: DateTime.now(),
+      )
+    ]);
+    
+    await tester.pumpWidget(
+      ChangeNotifierProvider.value(
+        value: provider,
+        child: const WaitingRoomApp(),
+      ),
+    );
+    
+    expect(find.text('Sam'), findsOneWidget);
+    expect(find.textContaining('51.5074'), findsOneWidget);
   });
 }

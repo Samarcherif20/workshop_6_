@@ -2,66 +2,100 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'models/client.dart';
+import 'package:uuid/uuid.dart';
+import 'local_queue_service.dart';
+import 'geolocation_service.dart';
 
 class QueueProvider extends ChangeNotifier {
   final List<Client> _clients = [];
   List<Client> get clients => _clients;
 
   final SupabaseClient _supabase = Supabase.instance.client;
+  final LocalQueueService _localDb = LocalQueueService();
+  final GeolocationService _geoService;
+
   late RealtimeChannel _subscription;
 
-  QueueProvider() {
-    _fetchInitialClients();  // Charge les données initiales
-    _setupRealtimeSubscription(); // S'abonne aux mises à jour
+  QueueProvider({GeolocationService? geoService})
+      : _geoService = geoService ?? GeolocationService() {
+    initialize();
   }
-  
 
-  /// Fetch all clients that already exist in the DB
+  Future<void> initialize() async {
+    await _loadQueue();
+    _setupRealtimeSubscription();
+  }
+
+  Future<void> _loadQueue() async {
+    final localClients = await _localDb.getClients();
+    _clients
+      ..clear()
+      ..addAll(localClients.map((map) => Client.fromMap(map)));
+    notifyListeners();
+
+    await _syncLocalToRemote();
+    await _fetchInitialClients();
+  }
+
+  Future<void> _syncLocalToRemote() async {
+    final unsynced = await _localDb.getUnsyncedClients();
+    for (var client in unsynced) {
+      try {
+        final remoteClient = Map<String, dynamic>.from(client)
+          ..remove('is_synced');
+        await _supabase.from('clients').upsert(remoteClient);
+        await _localDb.markClientAsSynced(client['id'] as String);
+      } catch (e) {
+        print('Sync failed for ${client['id']}: $e');
+      }
+    }
+  }
+
   Future<void> _fetchInitialClients() async {
     try {
-      final data = await _supabase
-          .from('clients')
-          .select()
-          .order('created_at');
-
+      final data =
+          await _supabase.from('clients').select().order('created_at');
       _clients
         ..clear()
         ..addAll((data as List).map((e) => Client.fromMap(e)));
       notifyListeners();
-
       print('Fetched ${_clients.length} clients.');
     } catch (e) {
       print('Error fetching clients: $e');
     }
-    notifyListeners();
   }
 
-  /// Realtime subscription (INSERT + DELETE)
   void _setupRealtimeSubscription() {
     _subscription = _supabase.channel('public:clients')
-      .onPostgresChanges(
+      ..onPostgresChanges(
         event: PostgresChangeEvent.insert,
         schema: 'public',
         table: 'clients',
-        callback: (payload) {
+        callback: (payload) async {
           try {
-            final newClient = Client.fromMap(payload.newRecord!);
-            _clients.add(newClient);
-            _clients.sort((a, b) => a.createdAt.compareTo(b.createdAt));
-            notifyListeners();
-            print('Client inserted: ${newClient.name}');
+            final newClient = Client.fromMap(payload.newRecord);
+            final exists = _clients.any((c) => c.id == newClient.id);
+            if (!exists) {
+              final localClient = Map<String, dynamic>.from(payload.newRecord)
+                ..['is_synced'] = 1;
+              await _localDb.insertClientLocally(localClient);
+              _clients.add(newClient);
+              _clients.sort((a, b) => a.createdAt.compareTo(b.createdAt));
+              notifyListeners();
+              print('Client inserted: ${newClient.name}');
+            }
           } catch (e) {
             print('Error handling insert: $e');
           }
         },
       )
-      .onPostgresChanges(
+      ..onPostgresChanges(
         event: PostgresChangeEvent.delete,
         schema: 'public',
         table: 'clients',
-        callback: (payload) {
+        callback: (payload) async {
           try {
-            final deletedId = payload.oldRecord!['id'] as String;
+            final deletedId = payload.oldRecord['id'] as String;
             _clients.removeWhere((c) => c.id == deletedId);
             notifyListeners();
             print('Client deleted: $deletedId');
@@ -70,12 +104,28 @@ class QueueProvider extends ChangeNotifier {
           }
         },
       )
-      .subscribe();// DÉMARE l'écoute - CRITIQUE!
-    // Sans subscribe(), aucun événement n'est reçu
-    // Retourne un StreamSubscription qu'on stocke dans _subscription
+      ..onPostgresChanges(
+        event: PostgresChangeEvent.update,
+        schema: 'public',
+        table: 'clients',
+        callback: (payload) async {
+          try {
+            final updatedClient = Client.fromMap(payload.newRecord);
+            final index =
+                _clients.indexWhere((c) => c.id == updatedClient.id);
+            if (index != -1) {
+              _clients[index] = updatedClient;
+              notifyListeners();
+              print('Client updated: ${updatedClient.name}');
+            }
+          } catch (e) {
+            print('Error handling update: $e');
+          }
+        },
+      )
+      ..subscribe();
   }
 
-  /// Add a new client
   Future<void> addClient(String name) async {
     if (name.trim().isEmpty) {
       print('Cannot add empty client name');
@@ -83,24 +133,63 @@ class QueueProvider extends ChangeNotifier {
     }
 
     try {
-      await _supabase.from('clients').insert({'name': name.trim()});
-      print('Client added: $name');
+      final position = await _geoService.getCurrentPosition();
+      final newClient = {
+        'id': const Uuid().v4(),
+        'name': name.trim(),
+        'lat': position?.latitude,
+        'lng': position?.longitude,
+        'created_at': DateTime.now().toIso8601String(),
+        'is_synced': 0,
+      };
+
+      await _localDb.insertClientLocally(newClient);
+      final clientObj = Client.fromMap(newClient);
+      _clients.add(clientObj);
+      _clients.sort((a, b) => a.createdAt.compareTo(b.createdAt));
+      notifyListeners();
+
+      unawaited(_syncAddClientToRemote(newClient));
+      print('Client added locally: $name');
     } catch (e) {
-      print('Failed to add client: $e');
+      print('Failed to add client locally: $e');
     }
   }
 
-  /// Remove client by id
+  Future<void> _syncAddClientToRemote(Map<String, dynamic> client) async {
+    try {
+      final remoteClient = Map<String, dynamic>.from(client)
+        ..remove('is_synced');
+      await _supabase.from('clients').upsert(remoteClient);
+      await _localDb.markClientAsSynced(client['id'] as String);
+      print('Client synced to remote: ${client['name']}');
+    } catch (e) {
+      print('Failed to sync client to remote: $e');
+    }
+  }
+
   Future<void> removeClient(String id) async {
     try {
-      await _supabase.from('clients').delete().match({'id': id});
-      print('Client removed: $id');
+      await _localDb.markClientAsSynced(id);
+      _clients.removeWhere((c) => c.id == id);
+      notifyListeners();
+
+      unawaited(_syncRemoveClientFromRemote(id));
+      print('Client removed locally: $id');
     } catch (e) {
-      print('Failed to remove client: $e');
+      print('Failed to remove client locally: $e');
     }
   }
 
-  /// Move queue to next client
+  Future<void> _syncRemoveClientFromRemote(String id) async {
+    try {
+      await _supabase.from('clients').delete().match({'id': id});
+      print('Client removal synced to remote: $id');
+    } catch (e) {
+      print('Failed to sync client removal to remote: $e');
+    }
+  }
+
   Future<void> nextClient() async {
     if (_clients.isEmpty) {
       print('Queue is empty!');
